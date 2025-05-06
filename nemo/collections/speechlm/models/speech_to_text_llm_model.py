@@ -338,6 +338,13 @@ class MCoreSpeechToTextLLM(MegatronModule, fn.FNMixin):
         self.model_type = ModelType.encoder_or_decoder
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
+        if hasattr(config, "learnable_prompt_token_len"):
+            self.num_prompt_tokens = config.learnable_prompt_token_len
+            self.learnable_prompt = nn.Embedding(self.num_prompt_tokens, language_model.config.hidden_size)
+        else:
+            self.num_prompt_tokens = None
+            self.learnable_prompt = None
+
         self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
         self._language_max_sequence_length = self.language_model.max_sequence_length
 
@@ -621,6 +628,25 @@ class MCoreSpeechToTextLLM(MegatronModule, fn.FNMixin):
             encoded = encoded.split(num_audios.tolist())
             encoded_len = encoded_len.split(num_audios.tolist())
 
+        # Prepend learnable prompts
+        if isinstance(encoded, torch.Tensor) and self.num_prompt_tokens is not None and self.learnable_prompt is not None:
+            # Prepare learnable prompt
+            batch_size = encoded.size(0)
+            prompt_ids = torch.arange(self.num_prompt_tokens, device=encoded.device).unsqueeze(0).repeat(batch_size, 1)
+            prompt_embeds = self.learnable_prompt(prompt_ids)  # (B, P, H)
+            
+            # Prepare BOS token
+            bos = torch.ones(
+                [encoded.shape[0], 1],
+                dtype=torch.int64,
+                device=encoded.device,
+            ) * self.tokenizer.bos
+            bos_embeds = self.language_model.embedding.word_embeddings(bos)
+
+            # Prepend prompts to speech tokens
+            encoded = torch.cat([bos_embeds, prompt_embeds, encoded], dim=1)
+            encoded_len = encoded_len + self.num_prompt_tokens + 1
+
         combined_embeddings, attention_mask, _, _, max_length = self.inject_perception_input(
             encoded, encoded_len, input_ids, input_length, context_start_idx
         )
@@ -631,6 +657,11 @@ class MCoreSpeechToTextLLM(MegatronModule, fn.FNMixin):
 
         if labels is not None:
             # Shift labels to the right
+            print(labels)
+            print(labels.shape)
+            print(input_length)
+            print(encoded_len)
+            print(max_length)
             final_labels = self._shift_labels_by_emb_len(labels, input_length, encoded_len, max_length, pad_token=0)
         else:
             final_labels = None

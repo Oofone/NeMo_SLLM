@@ -45,11 +45,13 @@ class MCoreASRModule(MegatronModule):
         encoder: NeuralModule,
         preprocessor: Optional[nn.Module] = None,
         spec_augment: Optional[nn.Module] = None,
+        spec_sub: Optional[nn.Module] = None,
     ):
         super().__init__(config=TransformerConfig(num_layers=1, hidden_size=1, num_attention_heads=16))
         self.encoder = encoder
         self.preprocessor = preprocessor
         self.spec_augmentation = spec_augment
+        self.spec_sub = spec_sub
 
     def maybe_preprocess_audio(
         self,
@@ -87,6 +89,10 @@ class MCoreASRModule(MegatronModule):
         # Spec augment is not applied during evaluation/testing
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
+
+        # Spec sub is not applied during evaluation/testing
+        if self.spec_sub is not None and self.training:
+            processed_signal = self.spec_sub(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
         return encoded, encoded_len
@@ -139,6 +145,7 @@ class ASRModuleConfig(ModelParallelConfig, io.IOMixin):
     config: Optional[dict] = None
     preprocessor_config: Optional[dict] = None
     spec_augment_config: Optional[dict] = None
+    spec_sub_config: Optional[dict] = None
     init_from_pretrained_model: Optional[str] = None
     init_from_nemo_model: Optional[str] = None
     init_from_ptl_ckpt: Optional[str] = None
@@ -230,4 +237,14 @@ class ASRModuleConfig(ModelParallelConfig, io.IOMixin):
         else:
             spec_augment = None
 
-        return MCoreASRModule(encoder=model, preprocessor=preprocessor, spec_augment=spec_augment)
+        if self.spec_sub_config is not None:
+            spec_sub = Serialization.from_config_dict(to_dict_config(self.spec_sub_config))
+        else:
+            spec_sub = None
+
+        return MCoreASRModule(
+            encoder=model,
+            preprocessor=preprocessor,
+            spec_augment=spec_augment,
+            spec_sub=spec_sub
+        )

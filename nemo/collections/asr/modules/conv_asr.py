@@ -404,6 +404,110 @@ class ParallelConvASREncoder(NeuralModule, Exportable):
         return s_input[-1], length
 
 
+class WhisperProjector(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin):
+    """
+    NeMo-compatible projector for Whisper encoder output, adapted for LLM pipelines.
+    Includes downsampling + projection without softmax.
+    """
+
+    @property
+    def input_types(self):
+        return OrderedDict({
+            "encoder_output": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
+        })
+
+    @property
+    def output_types(self):
+        return OrderedDict({
+            "projected": NeuralType(('B', 'T', 'D'), LogitsType()),
+        })
+
+    def __init__(self, feat_in: int, feat_out: int, downsample_rate: int = 2, init_mode: str = "xavier_uniform"):
+        super().__init__()
+        self._feat_in = feat_in
+        self._feat_out = feat_out
+        self._ds_rate = downsample_rate
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(feat_in, feat_in, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(feat_in, feat_in * downsample_rate, kernel_size=3, stride=downsample_rate, padding=1)
+        )
+
+        self.linear_proj = nn.Sequential(
+            nn.Linear(feat_in * downsample_rate, feat_in),
+            nn.ReLU(),
+            nn.Linear(feat_in, feat_out),
+            nn.ReLU()
+        )
+
+        self.norm = nn.LayerNorm(feat_out)
+
+        self.apply(lambda m: self._init_weights(m, init_mode))
+
+        # # Optional adapter hooks
+        # self.set_accepted_adapter_types([adapter_mixins.LINEAR_ADAPTER_CLASSPATH])
+
+    @typecheck()
+    def forward(self, encoder_output):
+        # input: [B, D, T]
+        x = encoder_output
+        B, D, T = x.shape
+
+        # Ensure divisible by ds_rate
+        num_frames_to_discard = T % self._ds_rate
+        if num_frames_to_discard > 0:
+            x = x[:, :, :-num_frames_to_discard]
+
+        # Conv1d expects (B, D, T)
+        x = self.conv(x)  # [B, D', T']
+
+        # Prepare for linear layers
+        x = x.transpose(1, 2)  # [B, T', D']
+        x = self.linear_proj(x)
+        x = self.norm(x)
+
+        # Optional adapter forward
+        if self.is_adapter_available():
+            x = self.forward_enabled_adapters(x)
+
+        return x  # [B, T', feat_out]
+
+    def _init_weights(self, module, mode: str):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            if mode == "xavier_uniform":
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif mode == "kaiming_normal":
+                nn.init.kaiming_normal_(module.weight, nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def input_example(self, max_batch: int = 1, max_dim: int = 256):
+        # [B, D, T]
+        x = torch.randn(max_batch, self._feat_in, max_dim).to(next(self.parameters()).device)
+        return tuple([x])
+
+    def _prepare_for_export(self, **kwargs):
+        Exportable._prepare_for_export(self, **kwargs)
+
+    def add_adapter(self, name: str, cfg):
+        cfg = self._update_adapter_cfg_input_dim(cfg)
+        super().add_adapter(name=name, cfg=cfg)
+
+    def _update_adapter_cfg_input_dim(self, cfg):
+        return adapter_mixins.update_adapter_cfg_input_dim(self, cfg, module_dim=self._feat_out)
+
+    @property
+    def feat_in(self):
+        return self._feat_in
+
+    @property
+    def feat_out(self):
+        return self._feat_out
+
+
 class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin):
     """Simple ASR Decoder for use with CTC-based models such as JasperNet and QuartzNet
 

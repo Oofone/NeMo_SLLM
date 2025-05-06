@@ -298,8 +298,15 @@ class TextProcessing:
                     )
                     self.context_key = "input"
                     self.answer_key = "output"
-            assert f'{{{self.context_key}}}' in self.prompt_template
-            assert f'{{{self.answer_key}}}' in self.prompt_template
+            # assert f'{{{self.context_key}}}' in self.prompt_template
+            # assert f'{{{self.answer_key}}}' in self.prompt_template
+            if f'{{{self.context_key}}}' not in self.prompt_template:
+                logging.warning(
+                    f"Context key {{{self.context_key}}} not found in prompt_template. "
+                    f"Proceeding with answer-only input."
+                )
+            if f'{{{self.answer_key}}}' not in self.prompt_template:
+                raise ValueError(f"Answer key {{{self.answer_key}}} must be present in the prompt_template.")
             # Make sure that '{output}' always occurs at the end of the prompt template string
             assert self.prompt_template.index(f'{{{self.answer_key}}}') == len(self.prompt_template) - len(
                 f'{{{self.answer_key}}}'

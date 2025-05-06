@@ -554,6 +554,60 @@ class SpectrogramAugmentation(NeuralModule):
         return augmented_spec
 
 
+class SpecSubstituteAugmentation(NeuralModule):
+    """
+    Performs Spectrogram Substitution.
+    """
+
+    @property
+    def input_types(self):
+        """Returns definitions of module input types"""
+        return {
+            "input_spec": NeuralType(('B', 'D', 'T'), SpectrogramType()),
+            "length": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        """Returns definitions of module output types"""
+        return {"augmented": NeuralType(('B', 'D', 'T'), SpectrogramType())}
+
+    def __init__(self, max_t=20, num_t_sub=3,):
+        super().__init__()
+        self.max_t = max_t
+        self.num_t_sub = num_t_sub
+
+    @typecheck()
+    def forward(self, input_spec, length,):
+        """
+        input_spec: (B, D, T) tensor
+        length: (B,) lengths in frames
+        """
+        B, _, _ = input_spec.shape
+        augmented = input_spec.clone()
+
+        for b in range(B):
+            max_frames = length[b]  # int or tensor with .item()
+            for _ in range(self.num_t_sub):
+                if max_frames <= 1:
+                    continue
+
+                # Precompute values with torch.randint (faster than python random)
+                start = torch.randint(0, max_frames, (1,)).item()
+                length_sub = torch.randint(1, min(self.max_t, max_frames - start + 1), (1,)).item()
+                end = min(max_frames, start + length_sub)
+
+                if start == 0:
+                    continue
+                pos = torch.randint(0, start + 1, (1,)).item()
+                src_start = max(0, start - pos)
+                src_end = min(max_frames, end - pos)
+
+                if src_end > src_start and end > start:
+                    augmented[b, :, start:end] = input_spec[b, :, src_start:src_end]
+        return augmented
+
+
 class MaskedPatchAugmentation(NeuralModule):
     """
     Zeroes out fixed size time patches of the spectrogram.
