@@ -90,6 +90,9 @@ def build_components(cfg: DictConfig, tokenizer: Optional[AutoTokenizer] = None)
         resume_modality_adapter_from_path=cfg['model'].get('resume_modality_adapter_from_path', None),
     )
 
+    if cfg['model'].get('use_learnable_prompt_tokens', False):
+        model_config.learnable_prompt_token_len = cfg['model'].get('learnable_prompt_tokens_len', 20)
+
     if model_config.language_model_from_pretrained:
         prepare_pretrained_llm_dist_ckpt(model_config)
 

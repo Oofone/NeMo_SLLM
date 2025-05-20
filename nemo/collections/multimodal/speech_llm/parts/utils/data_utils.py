@@ -303,8 +303,8 @@ class TextProcessing:
             if f'{{{self.context_key}}}' not in self.prompt_template:
                 logging.warning(
                     f"Context key {{{self.context_key}}} not found in prompt_template. "
-                    f"Proceeding with answer-only input."
-                )
+                    f"Proceeding with answer-only input.",
+                    mode=logging_mode.ONCE)
             if f'{{{self.answer_key}}}' not in self.prompt_template:
                 raise ValueError(f"Answer key {{{self.answer_key}}} must be present in the prompt_template.")
             # Make sure that '{output}' always occurs at the end of the prompt template string

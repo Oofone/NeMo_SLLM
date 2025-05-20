@@ -41,7 +41,7 @@ from omegaconf import DictConfig, ListConfig
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.asr.parts.utils.eval_utils import remove_punctuations
 from nemo.collections.common.data.utils import move_data_to_device
-from nemo.collections.common.metrics import MetricStringToTorchMetric, TextMetricsSet
+from nemo.collections.common.metrics import MetricStringToTorchMetric, TextMetricsSet, ClassificationMetricsSet
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
 from nemo.collections.llm import fn
 from nemo.collections.llm.gpt.model.base import (
@@ -338,7 +338,7 @@ class MCoreSpeechToTextLLM(MegatronModule, fn.FNMixin):
         self.model_type = ModelType.encoder_or_decoder
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
-        if hasattr(config, "learnable_prompt_token_len"):
+        if hasattr(config, "learnable_prompt_token_len") and config.learnable_prompt_token_len:
             self.num_prompt_tokens = config.learnable_prompt_token_len
             self.learnable_prompt = nn.Embedding(self.num_prompt_tokens, language_model.config.hidden_size)
         else:
@@ -657,11 +657,6 @@ class MCoreSpeechToTextLLM(MegatronModule, fn.FNMixin):
 
         if labels is not None:
             # Shift labels to the right
-            print(labels)
-            print(labels.shape)
-            print(input_length)
-            print(encoded_len)
-            print(max_length)
             final_labels = self._shift_labels_by_emb_len(labels, input_length, encoded_len, max_length, pad_token=0)
         else:
             final_labels = None
@@ -703,6 +698,7 @@ class SpeechToTextLLM(SpeechLanguageModel):
         model_transform: Optional[Callable[[nn.Module], nn.Module]] = None,
     ):
         super().__init__()
+        self.has_classification_metric = False
         self.config = config
         self.tokenizer = tokenizer
         self.optim = optim or MegatronOptimizerModule(config=OptimizerConfig(lr=1e-4, use_distributed_optimizer=True))
@@ -724,11 +720,21 @@ class SpeechToTextLLM(SpeechLanguageModel):
     def setup(self, stage: str):
         super().setup(stage)
         if hasattr(self.cfg.data, "validation_ds"):
+            self.has_classification_metric = False
             self.val_metric, self.val_metric_name = self.setup_metric(self.cfg.data.validation_ds)
             self.val_metric = torch.nn.ModuleList(self.val_metric) if self.val_metric is not None else None
             # Used other keys from metadata to calulate metrics
             if hasattr(self.cfg.data.validation_ds, "metric"):
                 self.val_metric_label_key = self.cfg.data.validation_ds.metric.get('label_key', 'labels')
+            if hasattr(self.cfg.data.validation_ds, "auxiliary_metrics") and self.cfg.data.validation_ds.auxiliary_metrics:
+                extracted_metrics = [self.extract_metric(metric_cfg=metric_cfg) for metric_cfg in self.cfg.data.validation_ds.auxiliary_metrics]
+                self.val_auxiliary_metrics = [(torch.nn.ModuleList(m).to(self.device), m_name) for m, m_name in extracted_metrics]
+            else:
+                self.val_auxiliary_metrics = []
+            if self.has_classification_metric:
+                self.has_val_classification_metric = True
+            else:
+                self.has_val_classification_metric = False
 
         if hasattr(self.cfg.data, "test_ds"):
             self.test_metric, self.test_metric_name = self.setup_metric(self.cfg.data.test_ds)
@@ -850,6 +856,54 @@ class SpeechToTextLLM(SpeechLanguageModel):
     def _metrics_require_string2category_map(self):
         return set(["f1", "accuracy", "average_precision"])
 
+    def extract_metric(self, metric_cfg):
+        if metric_cfg.name not in MetricStringToTorchMetric:
+            raise KeyError(
+                f"{metric_cfg.name} is not supported. List of supported metrics: {MetricStringToTorchMetric.keys()}"
+            )
+        if metric_cfg.name in self._metrics_require_string2category_map:
+            if metric_cfg.average is None:
+                raise ValueError(
+                    f"{metric_cfg.name} requires specifying whether you want to compute a micro or macro average. Found None."
+                )
+        if (
+            metric_cfg.get('labels_are_strings', False)
+            and metric_cfg.name in self._metrics_require_string2category_map
+        ):
+            if metric_cfg.num_classes is None:
+                raise ValueError(
+                    "Number of classes is not provided in the metric section within the data config. "
+                    f"Please provide the number of classes in the data config to use the {metric_cfg.name} metric."
+                )
+            if metric_cfg.get('class_labels', None) is None or not isinstance(
+                metric_cfg.get('class_labels', None), ListConfig
+            ):
+                raise ValueError(
+                    "Class labels are not provided properly in the metric section witnin the data config. "
+                    f"Please provide the class labels as a list of strings in the data config to use the {metric_cfg.name} metric."
+                )
+            if len(metric_cfg.get('class_labels', None)) != metric_cfg.num_classes:
+                raise ValueError(
+                    f"Number of class labels {len(metric_cfg.get('class_labels', None))} does not match `num_classes` : {metric_cfg.num_classes}"
+                )
+        if metric_cfg.name in ClassificationMetricsSet:
+            if metric_cfg.get("num_classes", None) is None:
+                if not hasattr(self, "tokenizer") or self.tokenizer is None:
+                    raise ValueError("Tokenizer must be set to infer `num_classes` for classification metrics.")
+                metric_cfg["num_classes"] = self.tokenizer.vocab_size
+            if not hasattr(metric_cfg, "task") or metric_cfg.get("task", None) is None:
+                metric_cfg["task"] = "multiclass"
+
+        metric_name = metric_cfg.pop("name")
+        metric_cls = MetricStringToTorchMetric[metric_name]
+        if metric_name not in TextMetricsSet:
+            metric = [metric_cls(**metric_cfg)]
+            if metric_name in ClassificationMetricsSet:
+                self.has_classification_metric = True
+        else:
+            metric = [metric_cls()]
+        return metric, metric_name
+
     def setup_metric(self, data_cfg):
         metric_name = "exact_string_match"
         if not hasattr(data_cfg, "metric"):
@@ -859,42 +913,7 @@ class SpeechToTextLLM(SpeechLanguageModel):
                 raise ValueError("Metric name is not provided in the metric config.")
             if data_cfg.metric.name == "loss":
                 return None, "loss"
-            if data_cfg.metric.name not in MetricStringToTorchMetric:
-                raise KeyError(
-                    f"{data_cfg.metric.name} is not supported. List of supported metrics: {MetricStringToTorchMetric.keys()}"
-                )
-            if data_cfg.metric.name in self._metrics_require_string2category_map:
-                if data_cfg.metric.average is None:
-                    raise ValueError(
-                        f"{data_cfg.metric.name} requires specifying whether you want to compute a micro or macro average. Found None."
-                    )
-            if (
-                data_cfg.metric.get('labels_are_strings', False)
-                and data_cfg.metric.name in self._metrics_require_string2category_map
-            ):
-                if data_cfg.metric.num_classes is None:
-                    raise ValueError(
-                        "Number of classes is not provided in the metric section within the data config. "
-                        f"Please provide the number of classes in the data config to use the {data_cfg.metric.name} metric."
-                    )
-                if data_cfg.metric.get('class_labels', None) is None or not isinstance(
-                    data_cfg.metric.get('class_labels', None), ListConfig
-                ):
-                    raise ValueError(
-                        "Class labels are not provided properly in the metric section witnin the data config. "
-                        f"Please provide the class labels as a list of strings in the data config to use the {data_cfg.metric.name} metric."
-                    )
-                if len(data_cfg.metric.get('class_labels', None)) != data_cfg.metric.num_classes:
-                    raise ValueError(
-                        f"Number of class labels {len(data_cfg.metric.get('class_labels', None))} does not match `num_classes` : {data_cfg.metric.num_classes}"
-                    )
-
-            metric_name = data_cfg.metric.name
-            metric_cls = MetricStringToTorchMetric[metric_name]
-            if metric_name not in TextMetricsSet:
-                metric = [metric_cls(**data_cfg.metric)]
-            else:
-                metric = [metric_cls()]
+            metric, metric_name = self.extract_metric(data_cfg.metric)
         return metric, metric_name
 
     def inference_step(self, batch, mode):
@@ -945,6 +964,11 @@ class SpeechToTextLLM(SpeechLanguageModel):
                 labels_text = clean_end_string(labels_text, self.tokenizer, data_cfg.end_string)
 
             if data_cfg.get("remove_text_pc", False):
+                if data_cfg.get("log_every_n_steps", None) is not None:
+                    if batch_idx % data_cfg.log_every_n_steps == 0:
+                        logging.info(f"Input: `{inputs_text[0]}`")
+                        logging.info(f"Label: `{labels_text[0]}`")
+                        logging.info(f"Pred: `{preds_text[0]}`")
                 preds_text = [
                     remove_punctuations(pred_text.lower(), data_cfg.get("punctuations", None))
                     for pred_text in preds_text
@@ -953,12 +977,16 @@ class SpeechToTextLLM(SpeechLanguageModel):
                     remove_punctuations(label_text.lower(), data_cfg.get("punctuations", None))
                     for label_text in labels_text
                 ]
-
-            if data_cfg.get("log_every_n_steps", None) is not None:
-                if batch_idx % data_cfg.log_every_n_steps == 0:
-                    logging.info(f"Input: `{inputs_text[0]}`")
-                    logging.info(f"Label: `{labels_text[0]}`")
-                    logging.info(f"Pred: `{preds_text[0]}`")
+                if data_cfg.get("log_every_n_steps", None) is not None:
+                    if batch_idx % data_cfg.log_every_n_steps == 0:
+                        logging.info(f"Normalized Label: `{labels_text[0]}`")
+                        logging.info(f"Normalized Pred: `{preds_text[0]}`")
+            else:
+                if data_cfg.get("log_every_n_steps", None) is not None:
+                    if batch_idx % data_cfg.log_every_n_steps == 0:
+                        logging.info(f"Input: `{inputs_text[0]}`")
+                        logging.info(f"Label: `{labels_text[0]}`")
+                        logging.info(f"Pred: `{preds_text[0]}`")
 
         outputs = {
             'loss': loss,
@@ -969,6 +997,15 @@ class SpeechToTextLLM(SpeechLanguageModel):
         }
 
         if mode == 'validation':
+            if self.has_val_classification_metric:
+                preds_toks = []
+                labels_toks = []
+                for a, t, l in zip(batch['answers'], output['token_ids'], batch['context_lengths']):
+                    a_list = a.tolist()
+                    labels_toks.append(a_list[: a_list.index(self.tokenizer.eos) + 1])
+                    preds_toks.append(t[l.item() :][: a_list.index(self.tokenizer.eos) + 1])
+                outputs['preds_toks'] = preds_toks
+                outputs['labels_toks'] = labels_toks
             if self._num_validation_dl > 1:
                 self.validation_step_outputs[dataloader_idx].append(outputs)
             else:
@@ -1166,24 +1203,41 @@ class SpeechToTextLLM(SpeechLanguageModel):
         inp_label_set = set()
         deduplicated_outputs = {
             'preds': [],
+            'preds_toks': [],
             'labels': [],
+            'labels_toks': [],
             'inputs': [],
             'metadata': [],
         }
         total_size = 0
         for rank in range(0, parallel_state.get_data_parallel_world_size()):
             for batch in gathered_outputs[rank]:
-                for pred, label, input, metadata in zip(
-                    batch['preds'], batch['labels'], batch['inputs'], batch['metadata']
-                ):
-                    key = input + label + str(metadata)
-                    total_size += 1
-                    if key not in inp_label_set:
-                        inp_label_set.add(key)
-                        deduplicated_outputs['preds'].append(pred)
-                        deduplicated_outputs['labels'].append(label)
-                        deduplicated_outputs['inputs'].append(input)
-                        deduplicated_outputs['metadata'].append(metadata)
+                if 'preds_toks' in batch and 'labels_toks' in batch:
+                    for pred, preds_toks, label, labels_toks, input, metadata in zip(
+                        batch['preds'], batch['preds_toks'], batch['labels'], batch['labels_toks'], batch['inputs'], batch['metadata']
+                    ):
+                        key = input + label + str(metadata)
+                        total_size += 1
+                        if key not in inp_label_set:
+                            inp_label_set.add(key)
+                            deduplicated_outputs['preds'].append(pred)
+                            deduplicated_outputs['preds_toks'].append(preds_toks)
+                            deduplicated_outputs['labels'].append(label)
+                            deduplicated_outputs['labels_toks'].append(labels_toks)
+                            deduplicated_outputs['inputs'].append(input)
+                            deduplicated_outputs['metadata'].append(metadata)
+                else:
+                    for pred, label, input, metadata in zip(
+                        batch['preds'], batch['labels'], batch['inputs'], batch['metadata']
+                    ):
+                        key = input + label + str(metadata)
+                        total_size += 1
+                        if key not in inp_label_set:
+                            inp_label_set.add(key)
+                            deduplicated_outputs['preds'].append(pred)
+                            deduplicated_outputs['labels'].append(label)
+                            deduplicated_outputs['inputs'].append(input)
+                            deduplicated_outputs['metadata'].append(metadata)  
 
         # Compute metric score
         metric_name = self.val_metric_name if mode == 'validation' else self.test_metric_name
@@ -1198,10 +1252,14 @@ class SpeechToTextLLM(SpeechLanguageModel):
 
             # Compute metrics
             # SacreBLEU does not share the same interface as other metrics. We handle it separately.
-            for pred, label in zip(deduplicated_outputs['preds'], labels):
-                if metric_name == 'bleu':
-                    _ = metric_fn([pred], [[label]])
-                else:
+            if metric_name not in ClassificationMetricsSet:
+                for pred, label in zip(deduplicated_outputs['preds'], labels):
+                    if metric_name == 'bleu':
+                        _ = metric_fn([pred], [[label]])
+                    else:
+                        _ = metric_fn(pred, label)
+            else:
+                for pred, label in zip(deduplicated_outputs['preds_toks'], deduplicated_outputs['labels_toks']):
                     _ = metric_fn(pred, label)
 
             metric_result = metric_fn.compute()
@@ -1219,6 +1277,32 @@ class SpeechToTextLLM(SpeechLanguageModel):
 
             metric_fn.reset()
             averaged_metric.append(metric_result)
+        if mode == 'validation' and self.val_auxiliary_metrics:
+            for aux_metric, aux_metric_name in self.val_auxiliary_metrics:
+                aux_metric_fn = aux_metric[0]
+                aux_metric_log_key = self._determine_log_key(dataloader_idx, aux_metric_name, mode)
+                # Compute metrics
+                # SacreBLEU does not share the same interface as other metrics. We handle it separately.
+                if aux_metric_name not in ClassificationMetricsSet:
+                    for pred, label in zip(deduplicated_outputs['preds'], labels):
+                        if metric_name == 'bleu':
+                            _ = aux_metric_fn([pred], [[label]])
+                        else:
+                            _ = aux_metric_fn(pred, label)
+                else:
+                    for pred, label in zip(deduplicated_outputs['preds_toks'], deduplicated_outputs['labels_toks']):
+                        _ = aux_metric_fn(pred, label)
+                aux_metric_result = aux_metric_fn.compute()
+                # log the metrics
+                if aux_metric_result == 'rouge':
+                    for k, v in aux_metric_result.items():
+                        if 'fmeasure' in k:
+                            self.log(aux_metric_log_key + f'_{k}', v.item(), sync_dist=True, batch_size=1)
+                            logging.info(f"{aux_metric_log_key}_{k}]: {v.item()}")
+                else:
+                    self.log(aux_metric_log_key, aux_metric_result.item(), sync_dist=True, batch_size=1)
+                    logging.info(f"{aux_metric_log_key}: {aux_metric_result.item()}")
+                aux_metric_fn.reset()
 
         # Write predictions to file
         if self.global_rank == 0 and data_cfg.get("write_predictions_to_file", False):

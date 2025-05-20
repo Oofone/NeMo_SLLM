@@ -135,8 +135,12 @@ class SpeechLanguageModel(pl.LightningModule, io.IOMixin, io.ConnectorMixin, fn.
         self._num_validation_dl = getattr(data_module, "_num_validation_dl", None)
         self._validation_names = getattr(data_module, "_validation_names", None)
         if self._num_validation_dl is None:
-            # special case for lhotse dataloader
-            self._num_validation_dl = len(self._validation_names)
+            if self._validation_names is not None:
+                self._num_validation_dl = len(self._validation_names)
+            elif isinstance(self.trainer.datamodule._validation_ds, list):
+                self._num_validation_dl = len(self.trainer.datamodule._validation_ds)
+            else:
+                self._num_validation_dl = 1
 
         if self._validation_names is None:
             if not self._num_validation_dl:

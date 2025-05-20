@@ -431,11 +431,11 @@ class WhisperProjector(NeuralModule, Exportable, adapter_mixins.AdapterModuleMix
         self.conv = nn.Sequential(
             nn.Conv1d(feat_in, feat_in, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv1d(feat_in, feat_in * downsample_rate, kernel_size=3, stride=downsample_rate, padding=1)
+            nn.Conv1d(feat_in, feat_in * self._ds_rate, kernel_size=3, stride=self._ds_rate, padding=1)
         )
 
         self.linear_proj = nn.Sequential(
-            nn.Linear(feat_in * downsample_rate, feat_in),
+            nn.Linear(feat_in * self._ds_rate, feat_in),
             nn.ReLU(),
             nn.Linear(feat_in, feat_out),
             nn.ReLU()
@@ -449,7 +449,7 @@ class WhisperProjector(NeuralModule, Exportable, adapter_mixins.AdapterModuleMix
         # self.set_accepted_adapter_types([adapter_mixins.LINEAR_ADAPTER_CLASSPATH])
 
     @typecheck()
-    def forward(self, encoder_output):
+    def forward(self, encoder_output, encoded_lens):
         # input: [B, D, T]
         x = encoder_output
         B, D, T = x.shape
@@ -463,7 +463,7 @@ class WhisperProjector(NeuralModule, Exportable, adapter_mixins.AdapterModuleMix
         x = self.conv(x)  # [B, D', T']
 
         # Prepare for linear layers
-        x = x.transpose(1, 2)  # [B, T', D']
+        x = x.transpose(1, 2) # [B, T', feat_out]
         x = self.linear_proj(x)
         x = self.norm(x)
 
@@ -471,7 +471,7 @@ class WhisperProjector(NeuralModule, Exportable, adapter_mixins.AdapterModuleMix
         if self.is_adapter_available():
             x = self.forward_enabled_adapters(x)
 
-        return x  # [B, T', feat_out]
+        return x, (encoded_lens // self._ds_rate).long()
 
     def _init_weights(self, module, mode: str):
         if isinstance(module, (nn.Linear, nn.Conv1d)):

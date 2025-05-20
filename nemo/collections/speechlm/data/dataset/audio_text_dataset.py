@@ -102,7 +102,10 @@ def _speechllm_audio_text_collate_fn(
     pad_to_max_length: bool,
     max_seq_length: int,
     text_pad_id: int,
+    learnable_prompt: bool = False,
 ):
+    learnable_or_no_prompt = learnable_prompt or all(len(x['context_ids']) == 0 for x in batch)
+
     sample_ids = [x["idx"] for x in batch]
     sample_ids = torch.tensor(sample_ids, dtype=torch.int32)
 
@@ -111,14 +114,21 @@ def _speechllm_audio_text_collate_fn(
     audio_signal, audio_lengths = _audio_collate_fn(audio_signal, audio_lengths)
 
     input_ids = [item['input_ids'][:-1] for item in batch]
-    labels = [item['input_ids'][1:] for item in batch]
+
+    # If using learnable prompt or no context, we treat input_ids as answer-only
+    if not learnable_or_no_prompt:
+        labels = [item['input_ids'][1:] for item in batch]
+        loss_mask = [build_loss_mask(item)[1:] for item in batch]
+        max_length = max([len(x) for x in input_ids]) + tokens_to_generate
+    else:
+        labels = [item['input_ids'] for item in batch]
+        loss_mask = [build_loss_mask(item) for item in batch]
+        max_length = max([len(x) for x in input_ids]) + tokens_to_generate + 1
+
     contexts = [item['context_ids'] for item in batch]
     context_lengths = torch.LongTensor([item['context_length'] for item in batch])
     answers = [item['answer_ids'] for item in batch]
 
-    loss_mask = [build_loss_mask(item)[1:] for item in batch]
-
-    max_length = max([len(x) for x in input_ids]) + tokens_to_generate
     # increase max length to nearest multiple of 4 or 8
     if pad_to_max_length:
         max_length = max_seq_length
@@ -249,6 +259,7 @@ class AudioTextDataset(Dataset):
         context_key: str = 'context',
         answer_key: str = 'answer',
         context_file: Optional[Union[List[str], str]] = None,
+        learnable_prompt: bool = False,
     ):
         super().__init__()
         self.text_processor = text_processor
@@ -256,6 +267,7 @@ class AudioTextDataset(Dataset):
         self.min_seq_length = min_seq_length
         self.tokens_to_generate = tokens_to_generate
         self.pad_to_max_length = pad_to_max_length
+        self.learnable_prompt = learnable_prompt
 
         if isinstance(manifest_filepath, str):
             manifest_filepath = manifest_filepath.split(",")
@@ -331,6 +343,7 @@ class AudioTextDataset(Dataset):
             pad_to_max_length=self.pad_to_max_length,
             max_seq_length=self.max_seq_length,
             text_pad_id=self.text_processor.pad_id,
+            learnable_prompt=self.learnable_prompt
         )
 
     def collate_fn(self, batch):
@@ -1027,6 +1040,7 @@ def get_audio_text_dataset_from_config(
             context_key=config.get('context_key', 'context'),
             answer_key=config.get('answer_key', 'answer'),
             context_file=context_file,
+            learnable_prompt=config.get('learnable_prompt', False),
         )
         datasets.append(dataset)
 

@@ -1,4 +1,4 @@
-name: whisper-lv3-llama31-8b-only-adapter-stage1
+name: cv-20_mnsc-1-3_whisper-large-v3_linear_llama3.1-8b_instruct_adapter-whisper-full-stage1
 
 
 ############ Data ############
@@ -15,12 +15,15 @@ data:
     prompt_format: null  # prompt formatter to use, set according to the chosen LLM and check for support in nemo/collections/common/prompts
     tokens_to_generate: 128
     add_boa_eoa: false  # whether to add <boa> and <eoa> strings before and after audio features
-    prompt_template: "{answer}" # fstring to use for assistant prompt.
+
+    # below params are only used for non-lhotse dataloader, which are now DEPRECATED
+    audio_locator: null  # audio locator string in the context text for locating audios 
+    prompt_template: "{context}\n{answer}" # fstring to use for assistant prompt.
     separate_prompt_and_response_with_newline: False 
     truncation_field: 'context' 
-    add_bos: false           # <--- handled manually in forward()
-    add_eos: true           # <--- handled manually in forward()
-    add_sep: false           # <--- ensure nothing spurious gets inserted
+    add_eos: true 
+    add_sep: false 
+    add_bos: false
 
   train_ds:
     # Example of how to specify paths to multiple datasets
@@ -31,7 +34,11 @@ data:
     # Example of how each dataset is formatted
     # {'audio_filepath': 'audio1.wav', 'offset': 0.0, 'duration': 12.3, 'context': 'transcribe this audio', 'answer': 'I have a dream...'}
     # the 'answer' field can also be 'text', and a default 'context' field is added if missing in manigests, so as to work with ASR manifests
-    manifest_filepath: "/projects_vol/gp_aseschng/peng.yizhou/shared_data/MLC-SLM-Meta/train_manifest_random_speed.jsonl" # Path to a list of JSONL files corresponding to the source data.
+    manifest_filepath:
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/CommonVoice20_En_Meta/train_validated_transcripts.json
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/MNSC-Unpacked/train_all_manifests/merged/ASR-PART1-Train.jsonl
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/MNSC-Unpacked/train_all_manifests/merged/ASR-PART2-Train.jsonl
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/MNSC-Unpacked/train_all_manifests/merged/ASR-PART3-Train.jsonl
     global_batch_size: ${data.common.global_batch_size}
     micro_batch_size: ${data.common.micro_batch_size}
     shuffle: True
@@ -54,23 +61,33 @@ data:
     truncation_field: ${data.common.truncation_field} # Options: ['context', 'answer']
     prompt_template: ${data.common.prompt_template} # fstring to use for assistant prompt. Example: "Q: {input}\nA: {output}"
     # ASR configs
-    sample_rate: 16000
+    sample_rate: ${data.common.sample_rate}
     max_duration: 24 # it is set for LibriSpeech, you may need to update it for your dataset
     min_duration: 0.1
     # tarred datasets
-    is_concat: true
+    is_concat: false
     is_tarred: false
     tarred_audio_filepaths: null
     shuffle_n: 2048
     # bucketing params
     bucketing_strategy: "fully_randomized"
     bucketing_batch_size: null
+    audio_locator: ${data.common.audio_locator}
     prompt_format: ${data.common.prompt_format}
 
   validation_ds:
-    manifest_filepath: "/projects_vol/gp_aseschng/peng.yizhou/shared_data/MLC-SLM-Meta/dev_manifest.jsonl" # Path to a list of JSONL files corresponding to the source data. Data format is identical to train_ds.
-    global_batch_size: ${data.common.global_batch_size}
-    micro_batch_size: ${data.common.micro_batch_size}
+    name:
+      - CommonVoice-20-Val
+      - ASR-PART1-Test
+      - ASR-PART2-Test
+      - ASR-PART3-Test
+    manifest_filepath:
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/CommonVoice20_En_Meta/val_validated_transcripts.json
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/MNSC-Unpacked/test_all_manifests/merged/ASR-PART1-Test.jsonl
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/MNSC-Unpacked/test_all_manifests/merged/ASR-PART2-Test.jsonl
+      - /projects_vol/gp_aseschng/peng.yizhou/shared_data/MNSC-Unpacked/test_all_manifests/merged/ASR-PART3-Test.jsonl
+    global_batch_size: 2
+    micro_batch_size: 1
     shuffle: False
     num_workers: 0
     pin_memory: True
@@ -90,24 +107,31 @@ data:
     prompt_template: ${data.common.prompt_template} # fstring to use for assistant prompt. Example: "Q: {input}\nA: {output}"
     tokens_to_generate: ${data.common.tokens_to_generate}
     write_predictions_to_file: False
-    is_concat: true
     # ASR configs
-    sample_rate: 16000
+    sample_rate: ${data.common.sample_rate}
+    audio_locator: ${data.common.audio_locator}
     prompt_format: ${data.common.prompt_format}
+    remove_text_pc: True
 
     log_every_n_steps: 10
     metric:
-      name: "loss" # Name of the evaluation metric to use. Options: ['exact_string_match', 'loss', 'wer', 'bleu', 'rouge']
+      name: "wer" # Name of the evaluation metric to use. Options: ['exact_string_match', 'loss', 'wer', 'bleu', 'rouge']
       average: null # Average the metric over the dataset. Options: ['macro', 'micro']. Works only for 'F1', 'accuracy' etc. Refer to torchmetrics for metrics where this is supported.
-      num_classes: null
+    auxiliary_metrics:
+    - name: "accuracy"
+      average: "micro"      # or "micro"
+    - name: "f1"
+      average: "micro"      # or "micro"
 
 ############ Model ############
 model:
+  use_learnable_prompt_tokens: false
   freeze_language_model: true
-  freeze_speech_model: true
+  freeze_speech_model: false
   freeze_modality_adapter: false
+  
   llm:
-    pretrained_model: "meta-llama/Llama-3.1-8B"
+    pretrained_model: "meta-llama/Llama-3.1-8B-Instruct"
     _target_: nemo.collections.llm.LlamaModel
     config: 
       _target_: nemo.collections.llm.Llama31Config8B
@@ -143,7 +167,6 @@ model:
       downsample_rate: 4
 
 ############ Optimizer ############
-
 optim:
   _target_: nemo.lightning.MegatronOptimizerModule
   config:
@@ -210,6 +233,7 @@ resume:
   resume_if_exists: true
   resume_past_end: false
   resume_ignore_no_checkpoint: true
+
 
 ############ Logging ############
 logger:

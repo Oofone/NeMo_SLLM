@@ -309,6 +309,25 @@ class SpeechToTextGenerationStrategy(TextGenerationStrategy):
             audio_feats = audio_feats.split(num_audios.tolist())
             audio_feat_lens = audio_feat_lens.split(num_audios.tolist())
 
+        if isinstance(audio_feats, torch.Tensor) and self.model.num_prompt_tokens is not None and self.model.learnable_prompt is not None:
+            # Prepare learnable prompt
+            batch_size = audio_feats.size(0)
+            prompt_ids = torch.arange(
+                self.model.num_prompt_tokens, device=audio_feats.device).unsqueeze(0).repeat(batch_size, 1)
+            prompt_embeds = self.model.learnable_prompt(prompt_ids)  # (B, P, H)
+            
+            # Prepare BOS token
+            bos = torch.ones(
+                [audio_feats.shape[0], 1],
+                dtype=torch.int64,
+                device=audio_feats.device,
+            ) * self.model.tokenizer.bos
+            bos_embeds = self.model.language_model.embedding.word_embeddings(bos)
+
+            # Prepend prompts to speech tokens
+            audio_feats = torch.cat([bos_embeds, prompt_embeds, audio_feats], dim=1)
+            audio_feat_lens = audio_feat_lens + self.num_prompt_tokens + 1
+
         encoder_input, attention_mask, _, position_ids, encoder_max_length = self.model.inject_perception_input(
             audio_feats, audio_feat_lens, context_tokens, context_lengths, context_start_idx
         )
